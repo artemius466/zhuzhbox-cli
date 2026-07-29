@@ -1,0 +1,191 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    name: ${{ matrix.os }} / ${{ matrix.cc }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest,  cc: gcc,   cxx: g++ }
+          - { os: ubuntu-latest,  cc: clang, cxx: clang++ }
+          - { os: macos-latest,   cc: clang, cxx: clang++ }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install libcurl
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      # Warnings are a merge gate, not a cleanup task for later.
+      - name: Configure
+        env:
+          CC: ${{ matrix.cc }}
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DZB_WERROR=ON -DZB_BUILD_TESTS=ON
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  windows:
+    name: windows / msvc
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Install libcurl
+        run: vcpkg install curl:x64-windows
+
+      # Schannel means no CA bundle has to ship alongside the binary.
+      - name: Configure
+        run: >
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DZB_WERROR=ON
+          -DZB_BUILD_TESTS=ON
+          -DCMAKE_TOOLCHAIN_FILE=$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
+
+  # 25 GB files mean 64-bit offsets everywhere. A 32-bit build is the only
+  # thing that actually proves we got that right.
+  linux-32bit:
+    name: linux / 32-bit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Install 32-bit toolchain
+        run: |
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
+          sudo apt-get install -y gcc-multilib libcurl4-openssl-dev:i386 \
+                                  pkg-config
+
+      - name: Configure
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DZB_WERROR=ON \
+                -DZB_BUILD_TESTS=ON \
+                -DCMAKE_C_FLAGS=-m32 -DCMAKE_EXE_LINKER_FLAGS=-m32
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+      # The large-file check the mock server is deliberately too small for.
+      - name: Large-file offsets
+        run: ./build/tests/zhuzhbox_unit_tests
+
+  sanitizers:
+    name: asan + ubsan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Install libcurl
+        run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev
+
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Debug -DZB_SANITIZE=ON -DZB_BUILD_TESTS=ON
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        env:
+          ASAN_OPTIONS: detect_leaks=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: ctest --test-dir build --output-on-failure
+
+  valgrind:
+    name: valgrind
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libcurl4-openssl-dev valgrind
+
+      - name: Build
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Debug -DZB_BUILD_TESTS=ON
+          cmake --build build --parallel
+
+      # An upload, a download and an ls prune, with zero leaks and zero
+      # invalid accesses.
+      - name: Valgrind the real paths
+        run: |
+          python3 tests/mock_server.py --port 0 --state-file /tmp/mock.json \
+                  --spool-dir /tmp/spool &
+          for _ in $(seq 1 100); do [ -s /tmp/mock.json ] && break; sleep 0.1; done
+          BASE="http://127.0.0.1:$(python3 -c 'import json;print(json.load(open("/tmp/mock.json"))["port"])')"
+          export ZHUZHBOX_CONFIG_DIR=/tmp/zbconfig
+          head -c 3000000 /dev/urandom > /tmp/sample.bin
+          VG="valgrind --error-exitcode=9 --leak-check=full --show-leak-kinds=definite,indirect --errors-for-leak-kinds=definite,indirect"
+          $VG ./build/zhuzhbox --api "$BASE" --download-host "$BASE" upload /tmp/sample.bin -q --json > /tmp/up.json
+          TOKEN=$(python3 -c 'import json;print(json.load(open("/tmp/up.json"))["uploads"][0]["token"])')
+          $VG ./build/zhuzhbox --api "$BASE" --download-host "$BASE" get "$TOKEN" -o /tmp/back.bin -q
+          cmp /tmp/sample.bin /tmp/back.bin
+          $VG ./build/zhuzhbox --api "$BASE" ls -q
+          $VG ./build/zhuzhbox --api "$BASE" rm "$TOKEN" -y -q
+
+  rules-in-sync:
+    name: rules header in sync
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      # The rules text is bundled because no API endpoint serves it, so drift
+      # is the failure mode to watch for. Needs the website checkout; skipped
+      # with a warning when it is not available.
+      - name: Check out the website
+        id: site
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.ZHUZHBOX_SITE_REPO }}
+          path: vercel
+
+      - name: Verify src/rules_generated.h matches the site
+        if: steps.site.outcome == 'success'
+        run: tools/gen_rules --source vercel --output src/rules_generated.h --check
+
+      - name: Note the skip
+        if: steps.site.outcome != 'success'
+        run: |
+          echo "::warning::The website checkout was unavailable, so the bundled" \
+               "content rules could not be verified against it. Set the" \
+               "ZHUZHBOX_SITE_REPO repository variable to enable this check."

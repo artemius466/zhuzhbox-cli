@@ -1,0 +1,220 @@
+#!/usr/bin/env python3
+"""Regenerate src/rules_generated.h from the website's FAQ.
+
+The content rules are copied verbatim rather than paraphrased, and the result
+is committed so that building the CLI never needs the website checkout.
+
+    tools/gen_rules --source ../zhuzhbox --output src/rules_generated.h
+    tools/gen_rules --check                 # exit 1 if the committed header
+                                            # differs from what we would emit
+
+There is no API endpoint that serves the rules, so a bundled copy is the only
+option today. That makes drift the failure mode to guard against, which is what
+--check in CI is for.
+"""
+
+import argparse
+import html
+import pathlib
+import re
+import sys
+
+HEADER_TEMPLATE = '''/* rules_generated.h — GENERATED FILE, DO NOT EDIT BY HAND.
+ *
+ * Regenerate with `tools/gen_rules --source <website-checkout> --output
+ * src/rules_generated.h`, or `cmake --build build --target rules`.
+ *
+ * The text is copied verbatim from the website's FAQ (vercel/index.html and
+ * vercel/js/i18n.js) rather than paraphrased, and the result is committed so
+ * that building the CLI never requires the website checkout.
+ *
+ * Known sync risk: there is no API endpoint that serves the content rules, so
+ * this bundled copy can drift if the site's wording changes. The CI check that
+ * regenerating produces no diff is what catches that.
+ */
+#ifndef ZB_RULES_GENERATED_H
+#define ZB_RULES_GENERATED_H
+
+#define ZB_RULES_INTRO                                                         \\
+    {intro}
+
+typedef struct {{
+    const char *title;
+    const char *detail;
+}} zb_rule;
+
+static const zb_rule ZB_RULES[] = {{
+{rules}}};
+
+#define ZB_RULES_COUNT (sizeof(ZB_RULES) / sizeof(ZB_RULES[0]))
+
+#endif /* ZB_RULES_GENERATED_H */
+'''
+
+# Wrapped to stay inside 80 columns, the way clang-format would lay it out.
+LINE_WIDTH = 80
+
+
+def c_string(text):
+    """Escape `text` as a C string literal body (no surrounding quotes)."""
+    out = []
+    for ch in text:
+        if ch == '"':
+            out.append('\\"')
+        elif ch == "\\":
+            out.append("\\\\")
+        elif ch == "\n":
+            out.append("\\n")
+        elif ch == "\t":
+            out.append("\\t")
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def wrap_literal(text, indent, reserve=0):
+    """Split a long string into adjacent C literals that fit in 80 columns.
+
+    `reserve` is how many characters follow the closing quote on the final
+    line -- the "," after a title, the "}," after a detail.
+    """
+    escaped = c_string(text)
+    # The two quote characters are part of the line, so they come out of the
+    # budget alongside the indent and whatever trails the literal.
+    budget = LINE_WIDTH - len(indent) - 2 - reserve
+    if len(escaped) <= budget:
+        return ['"%s"' % escaped]
+
+    pieces = []
+    current = ""
+    for word in text.split(" "):
+        candidate = (current + " " + word) if current else word
+        # +1 because every piece but the last carries a trailing space.
+        if len(c_string(candidate)) + 1 > budget and current:
+            pieces.append(current + " ")
+            current = word
+        else:
+            current = candidate
+    if current:
+        pieces.append(current)
+    return ['"%s"' % c_string(piece) for piece in pieces]
+
+
+def strip_tags(fragment):
+    fragment = re.sub(r"<[^>]+>", "", fragment)
+    return html.unescape(fragment).strip()
+
+
+def extract_from_html(text):
+    """Pull the intro line and the (title, detail) pairs out of the FAQ."""
+    intro = None
+    match = re.search(r"Short and non-negotiable[^<]*", text)
+    if match:
+        intro = html.unescape(match.group(0)).strip()
+
+    rules = []
+    # Each rule is a <strong>/<b>/<dt> title followed by its explanation.
+    # The lookahead matters: without it "<b" also matches "<body".
+    pattern = re.compile(
+        r"<(strong|b|dt|h4)(?=[\s>])[^>]*>(.*?)</\1>\s*"
+        r"(?:<[^>]+>\s*)?([^<]{10,})",
+        re.DOTALL,
+    )
+    for _, title, detail in pattern.findall(text):
+        title_text = strip_tags(title)
+        detail_text = strip_tags(detail)
+        if not title_text or not detail_text:
+            continue
+        rules.append((title_text, detail_text))
+    return intro, rules
+
+
+def extract_from_i18n(text):
+    """Fall back to the translation table, where the rules are plain strings."""
+    intro = None
+    match = re.search(r"['\"]([^'\"]*Short and non-negotiable[^'\"]*)['\"]", text)
+    if match:
+        intro = match.group(1)
+
+    rules = []
+    pattern = re.compile(
+        r"rule(\d+)Title\s*:\s*['\"](.*?)['\"].*?"
+        r"rule\1(?:Body|Detail|Text)\s*:\s*['\"](.*?)['\"]",
+        re.DOTALL,
+    )
+    for _, title, detail in pattern.findall(text):
+        rules.append((title, detail))
+    return intro, rules
+
+
+def render(intro, rules):
+    intro_literals = wrap_literal(intro, "    ")
+    intro_block = ("\\\n" + " " * 4).join(intro_literals) if len(
+        intro_literals) > 1 else intro_literals[0]
+
+    blocks = []
+    for title, detail in rules:
+        title_literals = wrap_literal(title, "     ", reserve=1)
+        detail_literals = wrap_literal(detail, "     ", reserve=2)
+        title_block = ("\n" + " " * 5).join(title_literals)
+        detail_block = ("\n" + " " * 5).join(detail_literals)
+        blocks.append("    {%s,\n     %s},\n" % (title_block, detail_block))
+
+    return HEADER_TEMPLATE.format(intro=intro_block, rules="".join(blocks))
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--source", default="vercel",
+                        help="path to the website checkout (default: vercel)")
+    parser.add_argument("--output", default="src/rules_generated.h")
+    parser.add_argument("--check", action="store_true",
+                        help="exit 1 if --output differs from the regenerated "
+                             "text, instead of writing it")
+    args = parser.parse_args()
+
+    source = pathlib.Path(args.source)
+    intro, rules = None, []
+
+    index = source / "index.html"
+    if index.is_file():
+        intro, rules = extract_from_html(index.read_text(encoding="utf-8"))
+
+    if len(rules) != 5:
+        i18n = source / "js" / "i18n.js"
+        if i18n.is_file():
+            alt_intro, alt_rules = extract_from_i18n(
+                i18n.read_text(encoding="utf-8"))
+            if len(alt_rules) == 5:
+                intro, rules = alt_intro or intro, alt_rules
+
+    if not intro or len(rules) != 5:
+        sys.stderr.write(
+            "gen_rules: could not read five content rules out of %s.\n"
+            "           Point --source at a zhuzhbox website checkout (the\n"
+            "           directory holding index.html and js/i18n.js).\n"
+            "           The committed header was left alone.\n" % source)
+        return 2
+
+    generated = render(intro, rules)
+    output = pathlib.Path(args.output)
+
+    if args.check:
+        if not output.is_file():
+            sys.stderr.write("gen_rules: %s does not exist\n" % output)
+            return 1
+        if output.read_text(encoding="utf-8") != generated:
+            sys.stderr.write(
+                "gen_rules: %s is out of date with the website sources.\n"
+                "           Run `make rules` and commit the result.\n" % output)
+            return 1
+        print("gen_rules: %s is up to date" % output)
+        return 0
+
+    output.write_text(generated, encoding="utf-8")
+    print("gen_rules: wrote %s (%d rules)" % (output, len(rules)))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
