@@ -29,6 +29,7 @@ import signal
 import secrets
 import shutil
 import socket
+import socketserver
 import struct
 import sys
 import tempfile
@@ -105,6 +106,27 @@ class Blob:
             os.unlink(self.path)
         except OSError:
             pass
+
+
+class Server(ThreadingHTTPServer):
+    """ThreadingHTTPServer without the reverse-DNS lookup.
+
+    HTTPServer.server_bind() calls socket.getfqdn() on the bind address, which
+    is a reverse-DNS query. On a macOS CI runner there is no reverse entry for
+    127.0.0.1 and the resolver sits there for twenty-odd seconds before giving
+    up -- during which the server has not finished starting and has printed
+    nothing, so a harness waiting on it just times out with no explanation.
+
+    Nothing here needs server_name, so skip straight to TCPServer's bind.
+    """
+
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def server_bind(self):
+        socketserver.TCPServer.server_bind(self)
+        self.server_name = "127.0.0.1"
+        self.server_port = self.server_address[1]
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -668,7 +690,7 @@ def main():
     signal.signal(signal.SIGTERM, on_terminate)
     atexit.register(shutil.rmtree, SPOOL_DIR, True)
 
-    server = ThreadingHTTPServer(("127.0.0.1", OPTS.port), Handler)
+    server = Server(("127.0.0.1", OPTS.port), Handler)
     port = server.server_address[1]
     if OPTS.state_file:
         with open(OPTS.state_file, "w", encoding="utf-8") as handle:

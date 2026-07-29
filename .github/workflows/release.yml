@@ -1,0 +1,222 @@
+name: Release
+
+# Builds the four platform binaries the spec promises and, on a version
+# tag, publishes them to a GitHub Release with a SHA-256 sums file next to
+# them. workflow_dispatch lets the whole matrix be exercised without cutting
+# a release, which is the only way to shake out packaging bugs before they
+# ship.
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  # --------------------------------------------------------------------
+  # Linux: a fully static musl binary built inside an Alpine container, so
+  # the result runs on any x86_64/aarch64 Linux with no libcurl/openssl of
+  # its own. `actions/checkout` and `upload-artifact` are JS actions that
+  # need a glibc Node, which the container's musl userland can't run — so
+  # the container is invoked with `docker run` for just the compile step,
+  # and everything else happens on the ordinary (glibc) runner.
+  # --------------------------------------------------------------------
+  linux:
+    name: linux-${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build inside Alpine (static musl)
+        run: |
+          docker run --rm -v "${{ github.workspace }}":/src -w /src alpine:3.20 sh -euc '
+            apk add --no-cache build-base cmake curl-dev curl-static
+            cmake -B build-release -DCMAKE_BUILD_TYPE=Release \
+                  -DZB_STATIC_CURL=ON -DZB_BUILD_TESTS=OFF \
+                  -DCMAKE_EXE_LINKER_FLAGS=-static
+            cmake --build build-release --parallel
+            strip build-release/zhuzhbox
+            file build-release/zhuzhbox
+          '
+
+      - name: Package
+        id: package
+        run: |
+          set -eu
+          version="${GITHUB_REF_NAME#v}"
+          [ "$GITHUB_REF_TYPE" = "tag" ] || version="dev-${GITHUB_SHA::8}"
+          name="zhuzhbox-${version}-linux-${{ matrix.arch }}"
+          mkdir -p "dist/$name"
+          cp build-release/zhuzhbox "dist/$name/"
+          cp README.md LICENSE "dist/$name/"
+          tar -C dist -czf "dist/${name}.tar.gz" "$name"
+          sha256sum "dist/${name}.tar.gz" | awk '{print $1}' > "dist/${name}.tar.gz.sha256"
+          echo "archive=dist/${name}.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ matrix.arch }}
+          path: |
+            ${{ steps.package.outputs.archive }}
+            ${{ steps.package.outputs.archive }}.sha256
+          if-no-files-found: error
+
+  # --------------------------------------------------------------------
+  # macOS: one universal (arm64 + x86_64) binary, linked against the
+  # system's own libcurl rather than a Homebrew copy. The system libcurl
+  # ships as part of the Xcode SDK, is already universal, and is present on
+  # every Mac out of the box — so this needs nothing bundled alongside it
+  # and nothing installed on the machine that runs it.
+  # --------------------------------------------------------------------
+  macos:
+    name: macos-universal
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: |
+          sdk=$(xcrun --show-sdk-path)
+          cmake -B build-release -DCMAKE_BUILD_TYPE=Release \
+                -DZB_BUILD_TESTS=OFF \
+                -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" \
+                -DCMAKE_OSX_SYSROOT="$sdk"
+
+      - name: Build
+        run: cmake --build build-release --parallel
+
+      - name: Verify both architectures landed
+        run: |
+          strip -x build-release/zhuzhbox
+          lipo -info build-release/zhuzhbox
+          lipo -info build-release/zhuzhbox | grep -q 'arm64'
+          lipo -info build-release/zhuzhbox | grep -q 'x86_64'
+
+      - name: Package
+        id: package
+        run: |
+          set -eu
+          version="${GITHUB_REF_NAME#v}"
+          [ "$GITHUB_REF_TYPE" = "tag" ] || version="dev-${GITHUB_SHA:0:8}"
+          name="zhuzhbox-${version}-macos-universal"
+          mkdir -p "dist/$name"
+          cp build-release/zhuzhbox "dist/$name/"
+          cp README.md LICENSE "dist/$name/"
+          tar -C dist -czf "dist/${name}.tar.gz" "$name"
+          shasum -a 256 "dist/${name}.tar.gz" | awk '{print $1}' > "dist/${name}.tar.gz.sha256"
+          echo "archive=dist/${name}.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-universal
+          path: |
+            ${{ steps.package.outputs.archive }}
+            ${{ steps.package.outputs.archive }}.sha256
+          if-no-files-found: error
+
+  # --------------------------------------------------------------------
+  # Windows: libcurl and the CLI's own dependencies statically linked via a
+  # vcpkg static triplet, dynamic CRT (the Universal CRT ships with Windows
+  # itself, so this still needs nothing installed on the target machine).
+  # Default curl features pick Schannel on Windows, so there is no CA
+  # bundle to carry alongside the binary.
+  # --------------------------------------------------------------------
+  windows:
+    name: windows-x86_64
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install libcurl (static)
+        run: vcpkg install curl:x64-windows-static-md
+
+      - name: Configure
+        run: |
+          $toolchain = Join-Path $env:VCPKG_INSTALLATION_ROOT 'scripts\buildsystems\vcpkg.cmake'
+          if (-not (Test-Path $toolchain)) {
+            throw "vcpkg toolchain file not found at $toolchain"
+          }
+          cmake -B build-release -DCMAKE_BUILD_TYPE=Release `
+                -DZB_STATIC_CURL=ON -DZB_BUILD_TESTS=OFF `
+                "-DCMAKE_TOOLCHAIN_FILE=$toolchain" `
+                -DVCPKG_TARGET_TRIPLET=x64-windows-static-md
+
+      - name: Build
+        run: cmake --build build-release --config Release --parallel
+
+      - name: Package
+        id: package
+        shell: bash
+        run: |
+          set -eu
+          version="${GITHUB_REF_NAME#v}"
+          [ "$GITHUB_REF_TYPE" = "tag" ] || version="dev-${GITHUB_SHA:0:8}"
+          name="zhuzhbox-${version}-windows-x86_64"
+          mkdir -p "dist/$name"
+          cp build-release/Release/zhuzhbox.exe "dist/$name/"
+          cp README.md LICENSE "dist/$name/"
+          (cd dist && 7z a -tzip "${name}.zip" "$name" >/dev/null)
+          sha256sum "dist/${name}.zip" | awk '{print $1}' > "dist/${name}.zip.sha256"
+          echo "archive=dist/${name}.zip" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x86_64
+          path: |
+            ${{ steps.package.outputs.archive }}
+            ${{ steps.package.outputs.archive }}.sha256
+          if-no-files-found: error
+
+  # --------------------------------------------------------------------
+  # Gather every platform's archive, build one combined SHA256SUMS file,
+  # and — only on an actual tag push — attach all of it to a GitHub
+  # Release. workflow_dispatch runs stop here with the artifacts available
+  # for download from the run, which is enough to validate the matrix
+  # without publishing anything.
+  # --------------------------------------------------------------------
+  publish:
+    name: publish
+    needs: [linux, macos, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Build the combined checksum file
+        run: |
+          set -eu
+          cd dist
+          : > SHA256SUMS
+          for f in *.sha256; do
+            archive="${f%.sha256}"
+            printf '%s  %s\n' "$(cat "$f")" "$archive" >> SHA256SUMS
+            rm "$f"
+          done
+          sort -k2 -o SHA256SUMS SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Publish the release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+
+      - name: Upload the combined artifact set
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: all-platforms
+          path: dist/*

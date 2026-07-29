@@ -48,9 +48,12 @@ jobs:
         with:
           python-version: '3.x'
 
-      # Schannel means no CA bundle has to ship alongside the binary.
+      # The default feature set is what we want here. vcpkg has renamed the
+      # Schannel feature over time (winssl -> schannel), so naming it
+      # explicitly breaks depending on which vcpkg the runner ships; the
+      # default already selects the platform's native TLS backend.
       - name: Install libcurl
-        run: vcpkg install "curl[core,schannel]:x64-windows"
+        run: vcpkg install curl:x64-windows
 
       # The toolchain path goes through an intermediate variable and is quoted.
       # Interpolating $env: directly into an unquoted -D argument leaves the
