@@ -11,6 +11,20 @@ ZHUZHBOX=${1:?usage: cli_tests.sh <zhuzhbox binary> [mock_server.py]}
 MOCK=${2:-$(dirname "$0")/mock_server.py}
 PYTHON=${PYTHON:-python3}
 
+# CTest passes the interpreter CMake found at configure time. If that path has
+# since gone stale, fall back to whatever is on PATH rather than failing with
+# an empty server log.
+if ! "$PYTHON" -c '' >/dev/null 2>&1; then
+    for candidate in python3 python; do
+        if command -v "$candidate" >/dev/null 2>&1 &&
+           "$candidate" -c '' >/dev/null 2>&1; then
+            echo "note: $PYTHON is not usable; falling back to $candidate" >&2
+            PYTHON=$candidate
+            break
+        fi
+    done
+fi
+
 # Everything below runs from a scratch directory, so hold absolute paths.
 abspath() { "$PYTHON" -c 'import os,sys;print(os.path.abspath(sys.argv[1]))' "$1"; }
 ZHUZHBOX=$(abspath "$ZHUZHBOX")
@@ -19,15 +33,20 @@ MOCK=$(abspath "$MOCK")
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/zb-tests.XXXXXX")
 PASS=0
 FAIL=0
-SERVERS=()
+# A plain space-separated string rather than an array: expanding an empty array
+# under `set -u` is an error in bash 3.2, which is what macOS ships.
+SERVERS=
 
 cleanup() {
-    for pid in "${SERVERS[@]:-}"; do
-        [ -n "$pid" ] && kill "$pid" 2>/dev/null
+    local pid
+    for pid in $SERVERS; do
+        kill "$pid" 2>/dev/null
     done
     rm -rf "$WORK"
 }
-trap cleanup EXIT
+# INT/TERM/HUP as well as EXIT: a harness killed by a closed pipe or a
+# ctest timeout must still take its mock servers down with it.
+trap cleanup EXIT INT TERM HUP
 
 ok()   { PASS=$((PASS + 1)); printf '  ok   %s\n' "$1"; }
 bad()  { FAIL=$((FAIL + 1)); printf '  FAIL %s\n' "$1"; [ $# -gt 1 ] && printf '       %s\n' "$2"; }
@@ -46,18 +65,43 @@ MOCK_URL=
 start_mock() {
     local name=$1; shift
     local state="$WORK/$name.json"
-    "$PYTHON" "$MOCK" --port 0 --state-file "$state" --spool-dir "$WORK/spool-$name" \
-        "$@" >/dev/null 2>"$WORK/$name.log" &
-    SERVERS+=("$!")
-    for _ in $(seq 1 100); do
+    local pid
+
+    # ${1+"$@"} rather than "$@": bash 3.2 (which is what macOS ships) treats
+    # "$@" with zero positional parameters as an unbound variable under
+    # `set -u`, which would abort this function before the server ever ran.
+    "$PYTHON" "$MOCK" --port 0 --state-file "$state" \
+        --spool-dir "$WORK/spool-$name" ${1+"$@"} \
+        >/dev/null 2>"$WORK/$name.log" &
+    pid=$!
+    SERVERS="$SERVERS $pid"
+
+    for _ in $(seq 1 150); do
         [ -s "$state" ] && break
+        # Stop waiting the moment the process is gone; it is never coming back.
+        kill -0 "$pid" 2>/dev/null || break
         sleep 0.1
     done
+
     if [ ! -s "$state" ]; then
-        echo "could not start the mock server ($name)" >&2
-        cat "$WORK/$name.log" >&2
+        {
+            echo "could not start the mock server ($name)"
+            echo "  python:  $PYTHON"
+            "$PYTHON" --version 2>&1 | sed 's/^/  version: /'
+            echo "  script:  $MOCK"
+            echo "  state:   $state"
+            if kill -0 "$pid" 2>/dev/null; then
+                echo "  status:  still running but never wrote its state file"
+            else
+                wait "$pid" 2>/dev/null
+                echo "  status:  exited $?"
+            fi
+            echo "  --- server log ---"
+            cat "$WORK/$name.log" 2>/dev/null || echo "  (no log)"
+        } >&2
         exit 1
     fi
+
     MOCK_URL="http://127.0.0.1:$("$PYTHON" -c "import json,sys;print(json.load(open(sys.argv[1]))['port'])" "$state")"
 }
 
@@ -227,10 +271,18 @@ check "ls --json --reveal-tokens includes them" 0 $?
 "${Z[@]}" shelf show "$TOKEN" --json | "$PYTHON" -c 'import json,sys;assert json.load(sys.stdin)["deleteToken"]'
 check "shelf show reveals the delete token" 0 $?
 
-if [ "$(uname -s)" != "MINGW"* ]; then
-    MODE=$(stat -c '%a' "$ZHUZHBOX_CONFIG_DIR/shelf.json" 2>/dev/null || stat -f '%Lp' "$ZHUZHBOX_CONFIG_DIR/shelf.json")
-    check "shelf.json is mode 600" "600" "$MODE"
-fi
+# `[ x != y* ]` does not glob — it compares literally. A case statement does.
+# Windows has no POSIX mode bits, so the check only applies elsewhere.
+case "$(uname -s)" in
+    MINGW*|MSYS*|CYGWIN*)
+        ;;
+    *)
+        # GNU stat and BSD stat spell this differently.
+        MODE=$(stat -c '%a' "$ZHUZHBOX_CONFIG_DIR/shelf.json" 2>/dev/null \
+               || stat -f '%Lp' "$ZHUZHBOX_CONFIG_DIR/shelf.json" 2>/dev/null)
+        check "shelf.json is mode 600" "600" "$MODE"
+        ;;
+esac
 
 for key in newest name size expires; do
     "${Z[@]}" ls --sort "$key" >/dev/null 2>&1 || bad "ls --sort $key"

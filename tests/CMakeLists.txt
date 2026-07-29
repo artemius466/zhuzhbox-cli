@@ -15,17 +15,21 @@ add_test(NAME unit COMMAND zhuzhbox_unit_tests)
 find_package(Python3 COMPONENTS Interpreter)
 
 if(Python3_Interpreter_FOUND)
-  if(WIN32)
-    # The shell harnesses need a POSIX shell; on Windows CI they run under the
-    # bash that ships with Git.
-    find_program(BASH_EXECUTABLE NAMES bash)
+  # The harnesses need a POSIX shell. BASH_LAUNCHER is a *list*, because the
+  # two cases need different argument counts: passing a literal "bash" to an
+  # absolute bash path would make bash try to run a script called "bash".
+  find_program(BASH_EXECUTABLE NAMES bash)
+  if(BASH_EXECUTABLE)
+    set(BASH_LAUNCHER "${BASH_EXECUTABLE}")
+  elseif(NOT WIN32)
+    set(BASH_LAUNCHER /usr/bin/env bash)
   else()
-    set(BASH_EXECUTABLE /usr/bin/env)
+    set(BASH_LAUNCHER "")
   endif()
 
-  if(BASH_EXECUTABLE)
+  if(BASH_LAUNCHER)
     add_test(NAME cli
-      COMMAND ${BASH_EXECUTABLE} bash
+      COMMAND ${BASH_LAUNCHER}
               ${CMAKE_CURRENT_SOURCE_DIR}/cli_tests.sh
               $<TARGET_FILE:zhuzhbox>
               ${CMAKE_CURRENT_SOURCE_DIR}/mock_server.py)
@@ -35,7 +39,7 @@ if(Python3_Interpreter_FOUND)
 
     # Slower and timing-sensitive: it interrupts a real upload mid-flight.
     add_test(NAME resume
-      COMMAND ${BASH_EXECUTABLE} bash
+      COMMAND ${BASH_LAUNCHER}
               ${CMAKE_CURRENT_SOURCE_DIR}/resume_test.sh
               $<TARGET_FILE:zhuzhbox>
               ${CMAKE_CURRENT_SOURCE_DIR}/mock_server.py)

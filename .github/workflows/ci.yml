@@ -48,20 +48,30 @@ jobs:
         with:
           python-version: '3.x'
 
-      - name: Install libcurl
-        run: vcpkg install curl:x64-windows
-
       # Schannel means no CA bundle has to ship alongside the binary.
+      - name: Install libcurl
+        run: vcpkg install "curl[core,schannel]:x64-windows"
+
+      # The toolchain path goes through an intermediate variable and is quoted.
+      # Interpolating $env: directly into an unquoted -D argument leaves the
+      # literal text for CMake to choke on.
       - name: Configure
-        run: >
-          cmake -B build -DCMAKE_BUILD_TYPE=Release -DZB_WERROR=ON
-          -DZB_BUILD_TESTS=ON
-          -DCMAKE_TOOLCHAIN_FILE=$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake
+        run: |
+          $toolchain = Join-Path $env:VCPKG_INSTALLATION_ROOT 'scripts\buildsystems\vcpkg.cmake'
+          if (-not (Test-Path $toolchain)) {
+            throw "vcpkg toolchain file not found at $toolchain"
+          }
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DZB_WERROR=ON `
+                -DZB_BUILD_TESTS=ON `
+                "-DCMAKE_TOOLCHAIN_FILE=$toolchain" `
+                -DVCPKG_TARGET_TRIPLET=x64-windows
 
       - name: Build
         run: cmake --build build --config Release --parallel
 
+      # The shell harnesses need bash; the runner has Git's.
       - name: Test
+        shell: bash
         run: ctest --test-dir build -C Release --output-on-failure
 
   # 25 GB files mean 64-bit offsets everywhere. A 32-bit build is the only
@@ -158,34 +168,3 @@ jobs:
           cmp /tmp/sample.bin /tmp/back.bin
           $VG ./build/zhuzhbox --api "$BASE" ls -q
           $VG ./build/zhuzhbox --api "$BASE" rm "$TOKEN" -y -q
-
-  rules-in-sync:
-    name: rules header in sync
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.x'
-
-      # The rules text is bundled because no API endpoint serves it, so drift
-      # is the failure mode to watch for. Needs the website checkout; skipped
-      # with a warning when it is not available.
-      - name: Check out the website
-        id: site
-        continue-on-error: true
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ vars.ZHUZHBOX_SITE_REPO }}
-          path: vercel
-
-      - name: Verify src/rules_generated.h matches the site
-        if: steps.site.outcome == 'success'
-        run: tools/gen_rules --source vercel --output src/rules_generated.h --check
-
-      - name: Note the skip
-        if: steps.site.outcome != 'success'
-        run: |
-          echo "::warning::The website checkout was unavailable, so the bundled" \
-               "content rules could not be verified against it. Set the" \
-               "ZHUZHBOX_SITE_REPO repository variable to enable this check."

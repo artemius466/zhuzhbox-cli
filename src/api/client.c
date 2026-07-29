@@ -140,7 +140,7 @@ static int xferinfo_cb(void *userdata, curl_off_t dltotal, curl_off_t dlnow,
 
     /* This is the only thing that observes the interrupt flag during a
      * transfer; returning nonzero aborts it and the normal unwind path does
-     * the rest (§2.1). */
+     * the rest */
     if (zb_interrupted) {
         return 1;
     }
@@ -156,7 +156,7 @@ static int xferinfo_cb(void *userdata, curl_off_t dltotal, curl_off_t dlnow,
 
 /* Redact anything that looks like a delete token before it reaches the debug
  * log. --debug must never make a capability secret grep-able in a terminal
- * scrollback or a pasted bug report (§5). */
+ * scrollback or a pasted bug report */
 static void debug_write_redacted(const char *data, size_t len)
 {
     static const char *const k_secrets[] = {"x-delete-token:", "deletetoken"};

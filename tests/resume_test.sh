@@ -12,6 +12,17 @@ ZHUZHBOX=${1:?usage: resume_test.sh <zhuzhbox binary> [mock_server.py]}
 MOCK=${2:-$(dirname "$0")/mock_server.py}
 PYTHON=${PYTHON:-python3}
 
+# See the note in cli_tests.sh: tolerate a stale interpreter path from CMake.
+if ! "$PYTHON" -c '' >/dev/null 2>&1; then
+    for candidate in python3 python; do
+        if command -v "$candidate" >/dev/null 2>&1 &&
+           "$candidate" -c '' >/dev/null 2>&1; then
+            PYTHON=$candidate
+            break
+        fi
+    done
+fi
+
 abspath() { "$PYTHON" -c 'import os,sys;print(os.path.abspath(sys.argv[1]))' "$1"; }
 ZHUZHBOX=$(abspath "$ZHUZHBOX")
 MOCK=$(abspath "$MOCK")
@@ -25,19 +36,32 @@ cleanup() {
     [ -n "$SERVER_PID" ] && kill "$SERVER_PID" 2>/dev/null
     rm -rf "$WORK"
 }
-trap cleanup EXIT
+# INT/TERM/HUP as well as EXIT: a harness killed by a closed pipe or a
+# ctest timeout must still take its mock servers down with it.
+trap cleanup EXIT INT TERM HUP
 
 ok()  { PASS=$((PASS + 1)); printf '  ok   %s\n' "$1"; }
 bad() { FAIL=$((FAIL + 1)); printf '  FAIL %s\n' "$1"; [ $# -gt 1 ] && printf '       %s\n' "$2"; }
 check() { if [ "$2" = "$3" ]; then ok "$1"; else bad "$1" "expected [$2], got [$3]"; fi; }
 
 # Half a second per chunk gives a comfortable window to interrupt in.
-"$PYTHON" "$MOCK" --port 0 --state-file "$WORK/mock.json" --chunk-delay 0.5 --spool-dir "$WORK/spool" \
-    >/dev/null 2>"$WORK/mock.log" &
+"$PYTHON" "$MOCK" --port 0 --state-file "$WORK/mock.json" --chunk-delay 0.5 \
+    --spool-dir "$WORK/spool" >/dev/null 2>"$WORK/mock.log" &
 SERVER_PID=$!
-for _ in $(seq 1 100); do [ -s "$WORK/mock.json" ] && break; sleep 0.1; done
+for _ in $(seq 1 150); do
+    [ -s "$WORK/mock.json" ] && break
+    kill -0 "$SERVER_PID" 2>/dev/null || break
+    sleep 0.1
+done
 if [ ! -s "$WORK/mock.json" ]; then
-    echo "could not start the mock server" >&2
+    {
+        echo "could not start the mock server"
+        echo "  python:  $PYTHON"
+        "$PYTHON" --version 2>&1 | sed 's/^/  version: /'
+        echo "  script:  $MOCK"
+        echo "  --- server log ---"
+        cat "$WORK/mock.log" 2>/dev/null || echo "  (no log)"
+    } >&2
     exit 1
 fi
 BASE="http://127.0.0.1:$("$PYTHON" -c 'import json,sys;print(json.load(open(sys.argv[1]))["port"])' "$WORK/mock.json")"
@@ -61,13 +85,20 @@ ZHUZHBOX_SINGLE_SHOT=off "$ZHUZHBOX" --api "$BASE" --download-host "$BASE" \
     upload big.bin --no-resume -q > up.json 2>up.err &
 UPLOAD_PID=$!
 
-# Wait until at least one chunk has landed, then interrupt.
-for _ in $(seq 1 200); do
-    if [ -s "$ZHUZHBOX_CONFIG_DIR/sessions.json" ] &&
-       grep -q '"sentChunks"' "$ZHUZHBOX_CONFIG_DIR/sessions.json" 2>/dev/null &&
-       ! grep -q '"sentChunks":\s*\[\s*\]' "$ZHUZHBOX_CONFIG_DIR/sessions.json" 2>/dev/null; then
-        break
-    fi
+# Wait until at least one chunk has actually landed, then interrupt. Asking
+# Python how many chunks the session records avoids a grep pattern here; BSD
+# grep has no \s, so the GNU spelling would silently never match on macOS.
+for _ in $(seq 1 300); do
+    SENT_SO_FAR=$("$PYTHON" -c '
+import json, sys
+try:
+    sessions = json.load(open(sys.argv[1]))["sessions"]
+    print(len(sessions[0]["sentChunks"]) if sessions else 0)
+except Exception:
+    print(0)' "$ZHUZHBOX_CONFIG_DIR/sessions.json" 2>/dev/null || echo 0)
+    [ "$SENT_SO_FAR" -gt 0 ] 2>/dev/null && break
+    # Give up early if the upload died rather than waiting out the whole loop.
+    kill -0 "$UPLOAD_PID" 2>/dev/null || break
     sleep 0.1
 done
 sleep 0.5
