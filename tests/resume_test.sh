@@ -35,6 +35,12 @@ SERVER_PID=
 cleanup() {
     local i
 
+    # Defensive: normal script flow always waits on these before reaching
+    # here, but a trap firing mid-way through (a ctest timeout landing right
+    # between spawning one and waiting on it, say) should not leave either
+    # process behind.
+    [ -n "${WATCHER_PID:-}" ] && kill "$WATCHER_PID" 2>/dev/null
+    [ -n "${UPLOAD_PID:-}" ] && kill "$UPLOAD_PID" 2>/dev/null
     [ -n "$SERVER_PID" ] && kill "$SERVER_PID" 2>/dev/null
     # See the matching comment in cli_tests.sh: give the killed process a
     # moment to release its open file handles (Windows) before removing the
@@ -103,36 +109,56 @@ UPLOAD_PID=$!
 
 # Wait until at least one chunk has actually landed, then interrupt.
 #
-# sessions.json is written twice with meaningfully different content: once
-# right after /upload/init succeeds (geometry recorded, sentChunks still
-# empty), and again after each chunk PUT completes (sentChunks grows). A
-# naive "did the file's size grow past a size captured before the loop
-# started" check breaks on the FIRST of those — the init write — almost
-# immediately, since baseline_size is captured in the instant right after
-# backgrounding the upload, before it has had any chance to write anything at
-# all. That interrupts the process while it is still doing setup, which is
-# not what this test is for: it needs a real chunk to have landed, and
-# verified (by direct reproduction) to otherwise land the interrupt so early
-# it can even race the SIGINT handler installation itself. Treating the
-# file's first appearance as the baseline, and only breaking on growth PAST
-# that, waits out the init write correctly.
-sessions_path="$ZHUZHBOX_CONFIG_DIR/sessions.json"
-baseline_size=""
-for _ in $(seq 1 300); do
-    if [ -s "$sessions_path" ]; then
-        current_size=$(wc -c < "$sessions_path" | tr -d ' ')
-        if [ -z "$baseline_size" ]; then
-            baseline_size=$current_size
-        # +5 is comfortably past the byte or two a lone digit costs, so this
-        # doesn't fire on formatting noise alone.
-        elif [ "$current_size" -gt $((baseline_size + 5)) ] 2>/dev/null; then
-            break
-        fi
+# This has gone through two size-heuristic attempts already (comparing
+# sessions.json's byte count against a baseline), both of which produced
+# false positives on some write to the file that was NOT a chunk landing —
+# first the immediate post-init geometry write, then something else on
+# Windows CI that was never fully identified (no Windows machine was
+# available to trace it directly, and by that point two size-heuristic
+# theories had already turned out to be wrong). A byte-count comparison
+# cannot be made unambiguous without knowing every reason the file's size
+# might change, and that list has already proven to be longer than expected
+# twice. Actually parsing the field this test cares about — sentChunks's
+# length — removes the whole class of "some other write also grew the file"
+# false positive, whatever future cause that turns out to have. To avoid
+# reintroducing the per-iteration subprocess-spawn cost that motivated the
+# size heuristic in the first place, a single Python watcher process polls
+# internally and this script waits on that one process, not 300 of them.
+"$PYTHON" - "$ZHUZHBOX_CONFIG_DIR/sessions.json" > watcher.out 2>watcher.err <<'PY' &
+import json
+import sys
+import time
+
+path = sys.argv[1]
+deadline = time.time() + 45
+
+while time.time() < deadline:
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            sessions = json.load(handle)["sessions"]
+        if sessions and len(sessions[0].get("sentChunks", [])) > 0:
+            print("chunk-landed")
+            sys.exit(0)
+    except (OSError, ValueError, KeyError, IndexError):
+        pass  # the file may not exist yet, or be mid-write; just keep polling
+    time.sleep(0.05)
+
+print("timed-out")
+sys.exit(1)
+PY
+WATCHER_PID=$!
+
+# Bound the wait by both the watcher's own deadline and the upload process
+# actually still being alive, so a crashed upload does not hang this script
+# for the watcher's full 45s budget.
+while kill -0 "$WATCHER_PID" 2>/dev/null; do
+    if ! kill -0 "$UPLOAD_PID" 2>/dev/null; then
+        kill "$WATCHER_PID" 2>/dev/null
+        break
     fi
-    # Give up early if the upload died rather than waiting out the whole loop.
-    kill -0 "$UPLOAD_PID" 2>/dev/null || break
     sleep 0.1
 done
+wait "$WATCHER_PID" 2>/dev/null
 sleep 0.5
 kill -INT "$UPLOAD_PID" 2>/dev/null
 wait "$UPLOAD_PID"
