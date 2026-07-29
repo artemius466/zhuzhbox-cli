@@ -38,11 +38,31 @@ FAIL=0
 SERVERS=
 
 cleanup() {
-    local pid
+    local pid i
+
     for pid in $SERVERS; do
         kill "$pid" 2>/dev/null
     done
-    rm -rf "$WORK"
+    # Give killed processes a moment to actually release their open file
+    # handles before we try to remove the directory those files live in —
+    # Windows refuses to delete a file any process still has open, unlike
+    # POSIX where unlinking an open file just works.
+    for pid in $SERVERS; do
+        for i in 1 2 3 4 5; do
+            kill -0 "$pid" 2>/dev/null || break
+            sleep 0.2
+        done
+    done
+
+    # Even past that, a file this run just wrote can still be transiently
+    # locked by a background virus scanner on Windows CI runners — a known,
+    # otherwise-harmless race. Retry a few times with backoff before giving
+    # up quietly; this is cleanup, not a test result.
+    for i in 1 2 3 4 5; do
+        rm -rf "$WORK" 2>/dev/null && break
+        sleep 0.3
+    done
+    rm -rf "$WORK" 2>/dev/null || true
 }
 # INT/TERM/HUP as well as EXIT: a harness killed by a closed pipe or a
 # ctest timeout must still take its mock servers down with it.

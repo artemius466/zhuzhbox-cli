@@ -22,6 +22,25 @@ extern volatile sig_atomic_t zb_interrupted;
 
 void zb_install_signal_handlers(void);
 
+/* ---------- argv ---------- */
+
+/* A UTF-8 argv, regardless of the process's ANSI code page.
+ *
+ * On POSIX this just duplicates `argv` — it is already UTF-8. On Windows the
+ * CRT's narrow `argv` is built from GetCommandLineW() through the *active
+ * ANSI code page*, which silently mangles or drops any character that code
+ * page cannot represent — a Cyrillic filename on the default Western code
+ * page, for instance — before main() ever sees it. This bypasses that by
+ * reading the real (wide) command line directly and converting each argument
+ * to UTF-8 the same way the rest of platform.c does.
+ *
+ * On success returns 0 with an owned array of `argc` owned UTF-8 strings in
+ * out_argv; free it with zb_argv_free(). On failure returns -1 and leaves
+ * out_argc/out_argv untouched — the caller should fall back to the original
+ * argv it was given. */
+int zb_argv_utf8(int argc, char **argv, int *out_argc, char ***out_argv);
+void zb_argv_free(int argc, char **argv);
+
 /* ---------- console ---------- */
 
 /* Set the console to UTF-8 and enable ANSI escape processing. Safe to call

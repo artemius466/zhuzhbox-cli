@@ -26,6 +26,7 @@
 
 #include <fcntl.h>
 #include <io.h>
+#include <shellapi.h>
 #include <shlobj.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -91,6 +92,91 @@ static char *narrow(const wchar_t *w)
     return s;
 }
 #endif
+
+/* ------------------------------------------------------------------ */
+/* argv                                                                 */
+/* ------------------------------------------------------------------ */
+
+int zb_argv_utf8(int argc, char **argv, int *out_argc, char ***out_argv)
+{
+#ifdef _WIN32
+    int wargc = 0;
+    wchar_t **wargv;
+    char **out;
+    int i;
+
+    (void)argc;
+    (void)argv;
+
+    /* Reading the real command line ourselves, rather than trusting the
+     * CRT-supplied narrow argv, is what avoids the active-code-page mangling
+     * described in the header comment. */
+    wargv = CommandLineToArgvW(GetCommandLineW(), &wargc);
+    if (wargv == NULL || wargc <= 0) {
+        LocalFree(wargv);
+        return -1;
+    }
+
+    out = zb_calloc((size_t)wargc, sizeof(*out));
+    if (out == NULL) {
+        LocalFree(wargv);
+        return -1;
+    }
+    for (i = 0; i < wargc; i++) {
+        out[i] = narrow(wargv[i]);
+        if (out[i] == NULL) {
+            while (i-- > 0) {
+                zb_free(out[i]);
+            }
+            zb_free(out);
+            LocalFree(wargv);
+            return -1;
+        }
+    }
+    LocalFree(wargv);
+
+    *out_argc = wargc;
+    *out_argv = out;
+    return 0;
+#else
+    char **out;
+    int i;
+
+    /* POSIX argv is already UTF-8 (or whatever the locale is, which this
+     * program treats as UTF-8 throughout); duplicate it so the caller has one
+     * ownership story on every platform instead of branching on which one it
+     * is running on. */
+    out = zb_calloc((size_t)argc, sizeof(*out));
+    if (out == NULL) {
+        return -1;
+    }
+    for (i = 0; i < argc; i++) {
+        out[i] = zb_strdup(argv[i]);
+        if (out[i] == NULL) {
+            while (i-- > 0) {
+                zb_free(out[i]);
+            }
+            zb_free(out);
+            return -1;
+        }
+    }
+    *out_argc = argc;
+    *out_argv = out;
+    return 0;
+#endif
+}
+
+void zb_argv_free(int argc, char **argv)
+{
+    int i;
+    if (argv == NULL) {
+        return;
+    }
+    for (i = 0; i < argc; i++) {
+        zb_free(argv[i]);
+    }
+    zb_free(argv);
+}
 
 /* ------------------------------------------------------------------ */
 /* Signals                                                              */
@@ -160,10 +246,29 @@ void zb_console_init(void)
 #endif
 }
 
+#ifdef _WIN32
+/* _isatty() is documented by Microsoft to also return nonzero for the NUL
+ * device, because it too is a "character device" in the CRT's sense — the
+ * same category as a console. That makes _isatty() alone useless for telling
+ * "an interactive console" apart from "redirected from /dev/null", which is
+ * exactly the distinction zb_confirm() needs to avoid hanging a script.
+ * GetConsoleMode() only succeeds on a real console handle, so it is the
+ * actual test; NUL, files, and pipes all fail it. */
+static int is_real_console(int fd)
+{
+    HANDLE h = (HANDLE)_get_osfhandle(fd);
+    DWORD mode;
+    if (h == INVALID_HANDLE_VALUE) {
+        return 0;
+    }
+    return GetConsoleMode(h, &mode) != 0;
+}
+#endif
+
 int zb_isatty_stdout(void)
 {
 #ifdef _WIN32
-    return _isatty(_fileno(stdout)) != 0;
+    return is_real_console(_fileno(stdout));
 #else
     return isatty(STDOUT_FILENO) != 0;
 #endif
@@ -172,7 +277,7 @@ int zb_isatty_stdout(void)
 int zb_isatty_stderr(void)
 {
 #ifdef _WIN32
-    return _isatty(_fileno(stderr)) != 0;
+    return is_real_console(_fileno(stderr));
 #else
     return isatty(STDERR_FILENO) != 0;
 #endif
@@ -181,7 +286,7 @@ int zb_isatty_stderr(void)
 int zb_isatty_stdin(void)
 {
 #ifdef _WIN32
-    return _isatty(_fileno(stdin)) != 0;
+    return is_real_console(_fileno(stdin));
 #else
     return isatty(STDIN_FILENO) != 0;
 #endif
