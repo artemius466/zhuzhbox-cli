@@ -103,24 +103,31 @@ UPLOAD_PID=$!
 
 # Wait until at least one chunk has actually landed, then interrupt.
 #
-# This used to ask Python how many chunks the session records, spawning a
-# fresh interpreter every 0.1s. That is cheap on Linux/macOS but Windows'
-# process creation is dramatically slower (CI runners commonly see 100ms+ per
-# python.exe start, versus single-digit ms for a POSIX fork+exec) — spent
-# across up to 300 iterations, that overhead alone could burn the entire
-# budget before a single chunk ever got the chance to land, which looks
-# identical to a genuine stall from the outside. Watching the session file's
-# size grow is just as decisive (an empty sentChunks array serializes far
-# smaller than one holding an index) and costs nothing but a stat() call.
+# sessions.json is written twice with meaningfully different content: once
+# right after /upload/init succeeds (geometry recorded, sentChunks still
+# empty), and again after each chunk PUT completes (sentChunks grows). A
+# naive "did the file's size grow past a size captured before the loop
+# started" check breaks on the FIRST of those — the init write — almost
+# immediately, since baseline_size is captured in the instant right after
+# backgrounding the upload, before it has had any chance to write anything at
+# all. That interrupts the process while it is still doing setup, which is
+# not what this test is for: it needs a real chunk to have landed, and
+# verified (by direct reproduction) to otherwise land the interrupt so early
+# it can even race the SIGINT handler installation itself. Treating the
+# file's first appearance as the baseline, and only breaking on growth PAST
+# that, waits out the init write correctly.
 sessions_path="$ZHUZHBOX_CONFIG_DIR/sessions.json"
-baseline_size=0
-[ -s "$sessions_path" ] && baseline_size=$(wc -c < "$sessions_path" | tr -d ' ')
+baseline_size=""
 for _ in $(seq 1 300); do
     if [ -s "$sessions_path" ]; then
         current_size=$(wc -c < "$sessions_path" | tr -d ' ')
+        if [ -z "$baseline_size" ]; then
+            baseline_size=$current_size
         # +5 is comfortably past the byte or two a lone digit costs, so this
         # doesn't fire on formatting noise alone.
-        [ "$current_size" -gt $((baseline_size + 5)) ] 2>/dev/null && break
+        elif [ "$current_size" -gt $((baseline_size + 5)) ] 2>/dev/null; then
+            break
+        fi
     fi
     # Give up early if the upload died rather than waiting out the whole loop.
     kill -0 "$UPLOAD_PID" 2>/dev/null || break
