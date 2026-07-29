@@ -222,7 +222,7 @@ int zb_report_error(const zb_options *opt, const zb_error *err)
         return ZB_EXIT_ERROR;
     }
 
-    /* The server's own `error` string is the message (§9); we only add the
+    /* The server's own `error` string is the message; we only add the
      * program name so it is obvious who is talking. */
     fprintf(stderr, "%szhuzhbox:%s %s\n", red, reset, zb_error_message(err));
 

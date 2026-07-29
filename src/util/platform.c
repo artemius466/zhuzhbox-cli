@@ -761,7 +761,14 @@ static int64_t days_from_civil(int64_t y, unsigned m, unsigned d)
     y -= (m <= 2);
     era = (y >= 0 ? y : y - 399) / 400;
     yoe = (unsigned)(y - era * 400);
-    doy = (153u * (m + (m > 2 ? -3u : 9u)) + 2u) / 5u + d - 1u;
+    /* (unsigned)-3 rather than -3u: the two compile to the identical
+     * wraparound value (UINT_MAX - 2), but get there differently. -3u
+     * negates an operand that is already unsigned, which is exactly what
+     * MSVC's C4146 warns about; (unsigned)-3 negates a signed literal and
+     * casts the result, which does not. Because the cast is explicit rather
+     * than an implicit conversion, it also does not trip GCC/Clang's
+     * -Wsign-conversion the way a bare "-3" added to unsigned `m` would. */
+    doy = (153u * (m + (m > 2 ? (unsigned)-3 : 9u)) + 2u) / 5u + d - 1u;
     doe = yoe * 365u + yoe / 4u - yoe / 100u + doy;
     return era * 146097 + (int64_t)doe - 719468;
 }

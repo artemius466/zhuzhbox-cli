@@ -1,4 +1,4 @@
-/* limits.h — service limits (§3.5). One place, so nothing hardcodes a duplicate. */
+/* limits.h — service limits. One place, so nothing hardcodes a duplicate. */
 #ifndef ZB_LIMITS_H
 #define ZB_LIMITS_H
 
@@ -28,7 +28,7 @@
 #define ZB_UPLOAD_RATE_LIMIT_WINDOW_MINUTES 15
 
 /* An upload session the server has not seen activity on for this long is
- * discarded. Local sessions older than this are pruned on startup (§8). */
+ * discarded. Local sessions older than this are pruned on startup. */
 #define ZB_UPLOAD_SESSION_TTL_MINUTES 180
 
 /* Only a fallback for display and for the single-shot cutoff default: the real

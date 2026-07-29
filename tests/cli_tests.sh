@@ -181,8 +181,18 @@ check "stdin upload size matches the piped bytes" \
 cmp -s piped-expected.txt piped-back.txt
 check "the stdin upload round-trips byte-identically" 0 $?
 
-ls "${TMPDIR:-/tmp}"/zhuzhbox-stdin-* >/dev/null 2>&1
-check "the stdin temp file was cleaned up" 2 $?
+# GNU ls exits 2 for "no such file" but BSD ls (macOS) exits 1 for the same
+# thing, so an ls-exit-code check is not portable. bash's own glob expansion
+# has one behavior on every platform: with nullglob on, an unmatched pattern
+# expands to nothing rather than being left literal.
+shopt -s nullglob
+stdin_temp_files=( "${TMPDIR:-/tmp}"/zhuzhbox-stdin-* )
+shopt -u nullglob
+if [ ${#stdin_temp_files[@]} -eq 0 ]; then
+    ok "the stdin temp file was cleaned up"
+else
+    bad "the stdin temp file was cleaned up" "found: ${stdin_temp_files[*]}"
+fi
 
 "${Z[@]}" upload "$WORK" >/dev/null 2>&1
 check "uploading a directory exits 2" 2 $?
