@@ -90,6 +90,15 @@ def main():
                         help="pause after progress appears, so the interrupt "
                              "lands mid-transfer rather than exactly on a "
                              "chunk boundary")
+    # Set the child's environment here rather than letting the caller wrap the
+    # command in env(1). A wrapper would sit between this script and the
+    # program under test as the process-group leader, and on Windows an MSYS
+    # env.exe has no console control handler -- so CTRL_BREAK would terminate
+    # *it* with STATUS_CONTROL_C_EXIT (0xC000013A) and that, not the real
+    # program's graceful 130, is the exit code we would end up reporting.
+    parser.add_argument("--env", action="append", default=[],
+                        metavar="NAME=VALUE",
+                        help="set a variable in the child's environment")
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
 
@@ -99,6 +108,15 @@ def main():
     if not command:
         sys.stderr.write("interrupt_helper: no command given\n")
         return 2
+
+    child_env = dict(os.environ)
+    for assignment in args.env:
+        name, separator, value = assignment.partition("=")
+        if not separator:
+            sys.stderr.write("interrupt_helper: --env wants NAME=VALUE, got %r\n"
+                             % assignment)
+            return 2
+        child_env[name] = value
 
     creationflags = 0
     if os.name == "nt":
@@ -118,7 +136,7 @@ def main():
 
     with open(args.stdout, "wb") as out, open(args.stderr, "wb") as errf:
         proc = subprocess.Popen(command, stdout=out, stderr=errf,
-                                creationflags=creationflags)
+                                env=child_env, creationflags=creationflags)
 
         started = time.time()
         while time.time() - started < args.timeout:

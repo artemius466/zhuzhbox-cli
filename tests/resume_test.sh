@@ -111,12 +111,17 @@ echo "== interrupt"
 # assertion pass misleadingly. `kill -0` is unreliable there for the same
 # reason, which is what made earlier wait-loops here break early. The helper
 # sends a real SIGINT on POSIX and a real CTRL_BREAK_EVENT on Windows.
+# The command is the program under test directly, with no env(1) wrapper:
+# a wrapper becomes the process-group leader, and on Windows MSYS's env.exe
+# has no console control handler, so CTRL_BREAK terminates it with
+# STATUS_CONTROL_C_EXIT and *that* becomes the exit code we observe instead
+# of zhuzhbox's own graceful 130. --env sets the variable in-process instead.
 "$PYTHON" "$(dirname "$MOCK")/interrupt_helper.py" \
     --sessions "$ZHUZHBOX_CONFIG_DIR/sessions.json" \
     --stdout up.json --stderr up.err \
     --min-chunks 1 \
-    -- env ZHUZHBOX_SINGLE_SHOT=off \
-       "$ZHUZHBOX" --api "$BASE" --download-host "$BASE" \
+    --env ZHUZHBOX_SINGLE_SHOT=off \
+    -- "$ZHUZHBOX" --api "$BASE" --download-host "$BASE" \
        upload big.bin --no-resume -q > interrupt.json 2>interrupt.err
 
 if [ ! -s interrupt.json ]; then
