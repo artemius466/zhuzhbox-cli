@@ -18,10 +18,45 @@ option(ZB_BUILD_TESTS "Build the test suite" OFF)
 # Dependencies: libcurl is linked, cJSON is vendored.
 # ---------------------------------------------------------------------------
 
-if(ZB_STATIC_CURL)
-  set(CURL_USE_STATIC_LIBS ON)
+# CMake's bundled FindCURL module does not reliably honor CURL_USE_STATIC_LIBS
+# — verified directly against CMake 3.29 / Alpine 3.20: with the hint set,
+# CURL::libcurl's IMPORTED_LOCATION still resolved to libcurl.so, and its
+# INTERFACE_LINK_LIBRARIES (the chain libcurl itself needs — openssl, zlib,
+# nghttp2, and the rest) came back LIBS-NOTFOUND rather than being resolved at
+# all. So on a Linux static build, skip FindCURL's static support entirely and
+# use pkg-config's own static variable set instead: pkg_check_modules always
+# computes both the dynamic and static closures regardless of which one is
+# requested, and the static one is unambiguous about exactly what a static
+# link needs. Windows gets its static curl from vcpkg's static triplet, which
+# already presents CURL::libcurl as a correct static imported target without
+# any of this; macOS links the system's own libcurl dynamically regardless.
+set(ZB_CURL_TARGET CURL::libcurl)
+
+if(ZB_STATIC_CURL AND UNIX AND NOT APPLE)
+  find_package(PkgConfig REQUIRED)
+  pkg_check_modules(ZB_CURL_PC REQUIRED libcurl)
+  if(NOT ZB_CURL_PC_STATIC_LIBRARIES)
+    message(FATAL_ERROR
+      "ZB_STATIC_CURL was requested but pkg-config reports no static link "
+      "information for libcurl — is the static archive (libcurl.a and its "
+      "own dependencies' .a files) actually installed?")
+  endif()
+  add_library(zb_curl_static INTERFACE)
+  target_link_directories(zb_curl_static INTERFACE
+    ${ZB_CURL_PC_STATIC_LIBRARY_DIRS})
+  target_link_libraries(zb_curl_static INTERFACE
+    ${ZB_CURL_PC_STATIC_LIBRARIES})
+  target_compile_options(zb_curl_static INTERFACE
+    ${ZB_CURL_PC_STATIC_CFLAGS_OTHER})
+  target_include_directories(zb_curl_static INTERFACE
+    ${ZB_CURL_PC_STATIC_INCLUDE_DIRS})
+  set(ZB_CURL_TARGET zb_curl_static)
+else()
+  if(ZB_STATIC_CURL)
+    set(CURL_USE_STATIC_LIBS ON)
+  endif()
+  find_package(CURL 7.68 REQUIRED)
 endif()
-find_package(CURL 7.68 REQUIRED)
 
 add_library(cjson STATIC third_party/cJSON/cJSON.c)
 target_include_directories(cjson PUBLIC third_party/cJSON)
@@ -76,7 +111,7 @@ set(ZB_SOURCES
 
 add_library(zhuzhbox_core STATIC ${ZB_SOURCES})
 target_include_directories(zhuzhbox_core PUBLIC src)
-target_link_libraries(zhuzhbox_core PUBLIC CURL::libcurl cjson)
+target_link_libraries(zhuzhbox_core PUBLIC ${ZB_CURL_TARGET} cjson)
 
 # 25 GB files mean 64-bit offsets everywhere, including on 32-bit builds.
 target_compile_definitions(zhuzhbox_core PUBLIC _FILE_OFFSET_BITS=64)

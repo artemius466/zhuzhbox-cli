@@ -39,7 +39,15 @@ jobs:
       - name: Build inside Alpine (static musl)
         run: |
           docker run --rm -v "${{ github.workspace }}":/src -w /src alpine:3.20 sh -euc '
-            apk add --no-cache build-base cmake curl-dev curl-static
+            # curl-static only pulls in libcurl.a itself, not the .a files
+            # for what libcurl in turn statically links against (openssl,
+            # zlib, nghttp2, and the rest of pkg-config'"'"'s static closure
+            # for libcurl) — each needed explicitly, verified against a real
+            # build inside this exact image.
+            apk add --no-cache build-base cmake curl-dev curl-static \
+              openssl-libs-static nghttp2-static zlib-static brotli-static \
+              zstd-static libidn2-static libpsl-static c-ares-static \
+              libunistring-static
             cmake -B build-release -DCMAKE_BUILD_TYPE=Release \
                   -DZB_STATIC_CURL=ON -DZB_BUILD_TESTS=OFF \
                   -DCMAKE_EXE_LINKER_FLAGS=-static
