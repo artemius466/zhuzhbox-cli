@@ -35,12 +35,9 @@ SERVER_PID=
 cleanup() {
     local i
 
-    # Defensive: normal script flow always waits on these before reaching
-    # here, but a trap firing mid-way through (a ctest timeout landing right
-    # between spawning one and waiting on it, say) should not leave either
-    # process behind.
-    [ -n "${WATCHER_PID:-}" ] && kill "$WATCHER_PID" 2>/dev/null
-    [ -n "${UPLOAD_PID:-}" ] && kill "$UPLOAD_PID" 2>/dev/null
+    # The upload and its interrupt are owned by interrupt_helper.py, which
+    # waits for the child itself, so there is no upload PID to clean up here
+    # any more — only the mock server this script started directly.
     [ -n "$SERVER_PID" ] && kill "$SERVER_PID" 2>/dev/null
     # See the matching comment in cli_tests.sh: give the killed process a
     # moment to release its open file handles (Windows) before removing the
@@ -103,89 +100,71 @@ print(h.hexdigest())')
 
 echo "== interrupt"
 
-ZHUZHBOX_SINGLE_SHOT=off "$ZHUZHBOX" --api "$BASE" --download-host "$BASE" \
-    upload big.bin --no-resume -q > up.json 2>up.err &
-UPLOAD_PID=$!
-
-# Wait until at least one chunk has actually landed, then interrupt.
+# Starting the upload, waiting for real progress, and delivering the
+# interrupt all happen inside interrupt_helper.py rather than here.
 #
-# This has gone through two size-heuristic attempts already (comparing
-# sessions.json's byte count against a baseline), both of which produced
-# false positives on some write to the file that was NOT a chunk landing —
-# first the immediate post-init geometry write, then something else on
-# Windows CI that was never fully identified (no Windows machine was
-# available to trace it directly, and by that point two size-heuristic
-# theories had already turned out to be wrong). A byte-count comparison
-# cannot be made unambiguous without knowing every reason the file's size
-# might change, and that list has already proven to be longer than expected
-# twice. Actually parsing the field this test cares about — sentChunks's
-# length — removes the whole class of "some other write also grew the file"
-# false positive, whatever future cause that turns out to have. To avoid
-# reintroducing the per-iteration subprocess-spawn cost that motivated the
-# size heuristic in the first place, a single Python watcher process polls
-# internally and this script waits on that one process, not 300 of them.
-"$PYTHON" - "$ZHUZHBOX_CONFIG_DIR/sessions.json" > watcher.out 2>watcher.err <<'PY' &
-import json
-import sys
-import time
+# The shell cannot do this portably: `kill -INT` from Git bash against a
+# native Win32 child does not reach SetConsoleCtrlHandler (MSYS emulates
+# signals only among its own processes and otherwise falls back to
+# TerminateProcess), so the graceful path never ran on Windows while the
+# shell still reported 130 by its own convention — making even the exit-code
+# assertion pass misleadingly. `kill -0` is unreliable there for the same
+# reason, which is what made earlier wait-loops here break early. The helper
+# sends a real SIGINT on POSIX and a real CTRL_BREAK_EVENT on Windows.
+"$PYTHON" "$(dirname "$MOCK")/interrupt_helper.py" \
+    --sessions "$ZHUZHBOX_CONFIG_DIR/sessions.json" \
+    --stdout up.json --stderr up.err \
+    --min-chunks 1 \
+    -- env ZHUZHBOX_SINGLE_SHOT=off \
+       "$ZHUZHBOX" --api "$BASE" --download-host "$BASE" \
+       upload big.bin --no-resume -q > interrupt.json 2>interrupt.err
 
-path = sys.argv[1]
-deadline = time.time() + 45
+if [ ! -s interrupt.json ]; then
+    bad "the interrupt helper ran" "$(head -5 interrupt.err)"
+    printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
+    exit 1
+fi
 
-while time.time() < deadline:
-    try:
-        with open(path, "r", encoding="utf-8") as handle:
-            sessions = json.load(handle)["sessions"]
-        if sessions and len(sessions[0].get("sentChunks", [])) > 0:
-            print("chunk-landed")
-            sys.exit(0)
-    except (OSError, ValueError, KeyError, IndexError):
-        pass  # the file may not exist yet, or be mid-write; just keep polling
-    time.sleep(0.05)
+helper_field() {
+    "$PYTHON" -c 'import json,sys;print(json.load(open("interrupt.json")).get(sys.argv[1]))' "$1"
+}
 
-print("timed-out")
-sys.exit(1)
-PY
-WATCHER_PID=$!
+RC=$(helper_field exit_code)
+DELIVERED=$(helper_field delivered)
+DELIVERY_ERROR=$(helper_field delivery_error)
+SENT=$(helper_field chunks_at_interrupt)
+SENT_AFTER=$(helper_field chunks_after_exit)
 
-# Bound the wait by both the watcher's own deadline and the upload process
-# actually still being alive, so a crashed upload does not hang this script
-# for the watcher's full 45s budget.
-while kill -0 "$WATCHER_PID" 2>/dev/null; do
-    if ! kill -0 "$UPLOAD_PID" 2>/dev/null; then
-        kill "$WATCHER_PID" 2>/dev/null
-        break
+if [ "$DELIVERED" = "None" ]; then
+    # No console to generate a control event on, or the signal could not be
+    # sent. That is an environment limitation, not a defect in zhuzhbox, so
+    # say so loudly and skip the assertions that depend on the graceful path
+    # rather than reporting a failure this code did not cause.
+    echo "  SKIP interrupt-path assertions: could not deliver an interrupt"
+    echo "       reason: $DELIVERY_ERROR"
+else
+    check "SIGINT during an upload exits 130" 130 "$RC"
+
+    if [ -s "$ZHUZHBOX_CONFIG_DIR/sessions.json" ]; then
+        ok "a session file was left behind"
+    else
+        bad "a session file was left behind"
     fi
-    sleep 0.1
-done
-wait "$WATCHER_PID" 2>/dev/null
-sleep 0.5
-kill -INT "$UPLOAD_PID" 2>/dev/null
-wait "$UPLOAD_PID"
-RC=$?
 
-check "SIGINT during an upload exits 130" 130 "$RC"
+    if [ "$SENT_AFTER" -gt 0 ] 2>/dev/null; then
+        ok "the session records $SENT_AFTER chunk(s) already sent"
+    else
+        bad "the session records progress" \
+            "chunks at interrupt: $SENT, after exit: $SENT_AFTER (delivered via $DELIVERED)"
+    fi
 
-if [ -s "$ZHUZHBOX_CONFIG_DIR/sessions.json" ]; then
-    ok "a session file was left behind"
-else
-    bad "a session file was left behind"
+    if grep -qi "resume" up.err; then
+        ok "the interrupt message tells you how to continue"
+    else
+        bad "the interrupt message tells you how to continue" \
+            "stderr was: $(head -c 300 up.err)"
+    fi
 fi
-
-SENT=$("$PYTHON" -c '
-import json, sys
-data = json.load(open(sys.argv[1]))
-sessions = data["sessions"]
-print(len(sessions[0]["sentChunks"]) if sessions else 0)' "$ZHUZHBOX_CONFIG_DIR/sessions.json" 2>/dev/null || echo 0)
-
-if [ "$SENT" -gt 0 ]; then
-    ok "the session records $SENT chunk(s) already sent"
-else
-    bad "the session records progress" "sentChunks was $SENT"
-fi
-
-grep -qi "resume" up.err
-check "the interrupt message tells you how to continue" 0 $?
 
 echo "== resume"
 
